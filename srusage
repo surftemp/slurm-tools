@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+"""
+Show job resource usage retrieved from sacct
+"""
+import argparse
+import datetime
+import io
+import re
+import subprocess
+
+import numpy as np
+import pandas as pd
+
+pd.set_option('display.max_rows', None)
+# pd.set_option('display.width', 200)
+
+rdate = re.compile(r'\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$')
+rnow = re.compile(r'(now|today)(-\d+)(\w+)$')
+
+
+def mem(s):
+    """Convert sacct number of M to floating point number.
+
+    Even when we specify units=M sacct may append Mn/Mc (ReqMem),
+    or M/nothing (other columns).
+    """
+    if s.endswith('Mn') or s.endswith('Mc'):
+        # Mn is per-node, Mc is per-core. Ignore the difference as we only
+        # support single-core serial jobs
+        return np.float64(s[:-2])
+    elif s.endswith('M'):
+        return np.float64(s[:-1])
+    elif s:
+        return np.float64(s)
+    else:
+        return np.nan
+
+
+converters = {
+    'MaxVMSize': mem,
+    'AveVMSize': mem,
+    'MaxRSS': mem,
+    'AveRSS': mem,
+    'MaxDiskRead': mem,
+    'AveDiskRead': mem,
+    'MaxDiskWrite': mem,
+    'AveDiskWrite': mem,
+    'ReqMem': mem,
+    'MinCPU': pd.Timedelta,
+    'AveCPU': pd.Timedelta,
+    'Elapsed': pd.Timedelta,
+    'CPUTime': pd.Timedelta,
+    'Reserved': pd.Timedelta,
+    'ResvCPU': pd.Timedelta,
+    'Suspended': pd.Timedelta,
+#    'SystemCPU': pd.Timedelta,  # slurm changes format when time is < 1 hour to: mm:ss.mmm
+    'Timelimit': pd.Timedelta,
+#    'TotalCPU': pd.Timedelta,  # slurm changes format when time is < 1 hour to: mm:ss.mmm
+    'Eligible': pd.Timestamp,
+    'End': pd.Timestamp,
+    'Start': pd.Timestamp,
+    'Submit': pd.Timestamp,
+    }
+
+
+def parse_timestr(text):
+    if rdate.match(text) or text in ['now', 'today']:
+        # Supported by sacct
+        return text
+    m = rnow.match(text)
+    if m:
+        # {now|today}{+|-}count is supported by later versions of Slurm, but the one we
+        # have. We will only support now-count as we want completed jobs
+        now = datetime.datetime.today()
+        if m.group(1) == 'today':
+            # Change to start of current day
+            now = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if m.group(3) not in ['days', 'minutes', 'hours', 'weeks']:
+            raise Exception('Units must be one of weeks, days, hours, or minutes')
+        offset = datetime.timedelta(**{m.group(3): int(m.group(2))})
+        return (now + offset).strftime('%Y-%m-%dT%H:%M:%S')
+    else:
+        raise Exception(f'Unable to parse {text}')
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-n', '--name', help='Show jobs matching these names')
+parser.add_argument('-p', '--partition', help='Partitions to view')
+parser.add_argument('-u', '--user', help='Display jobs from other user')
+parser.add_argument('-t', '--state', default='CD,F,OOM,TO',
+                    help='Comma separated list of jobs states to view')
+parser.add_argument('-S', '--starttime', default=datetime.date.today().isoformat(),
+                    help='Show jobs after specified time (default is start of current day)')
+parser.add_argument('-E', '--endtime', default='now',
+                    help='Show jobs before specified time (default is now)')
+parser.add_argument('--plot', action='store_true', help='Plot results')
+args = parser.parse_args()
+
+
+fmt = 'jobid,jobname,state,ResvCPURAW,Elapsed,NCPUS,CPUTimeRAW,TimelimitRaw,ReqMem,MaxRSS,MaxDiskRead,MaxDiskWrite,ExitCode'
+
+job = ['sacct', '-P', f'--format={fmt}', '--units=M', f'--state={args.state}']
+job.extend(['-S', parse_timestr(args.starttime), '-E', parse_timestr(args.endtime)])
+
+if args.name:
+    job.extend(['--name', args.name])
+
+if args.partition:
+    job.extend(['-r', args.partition])
+
+if args.user:
+    job.append(f'--user={args.user}')
+
+
+print(f'Gathering Slurm job statistics:\n{" ".join(job)}')
+subp = subprocess.run(job, capture_output=True, text=True)
+
+# TODO - following will only work for simple serial jobs i.e. each job must have
+# exactly two entries (allocation and batch step). Any multi-step job (or a job
+# which only shows the allocation) will break the results. Rewrite to extract
+# the ID and step part of the JobID. Then use groupby to collate the step stats
+
+lines = subp.stdout.splitlines()
+names = lines[0].split('|')
+# d1 = pd.read_csv(io.StringIO('\n'.join(lines[1::2])), sep='|', names=names, converters=converters)
+# d2 = pd.read_csv(io.StringIO('\n'.join(lines[2::2])), sep='|', names=names, converters=converters)
+# df = d2.where(d1.isnull(), d1)
+df = pd.read_csv(io.StringIO('\n'.join(lines[1:])), sep='|', names=names, converters=converters)
+
+jobstep = df.JobID.str.split('.')
+df['JobID'] = jobstep.str.get(0)
+df['Step'] = jobstep.str.get(1)
+df = df.set_index(['JobID', 'Step'])
+df_alloc = df.xs(pd.NA, level='Step')
+df_res = df.groupby('JobID').agg(dict(MaxRSS='sum', MaxDiskRead='sum', MaxDiskWrite='sum'))
+df = df_alloc.where(df_alloc.notnull(), df_res)
+
+df['Pending'] = df.ResvCPURAW / 60    # Time job was waiting in minutes
+df['Elapsed'] = df.Elapsed / pd.Timedelta('1m')
+df['CPUTime'] = df.CPUTimeRAW / 60    # Should be same as Elapsed
+df['Timelimit'] = df.TimelimitRaw
+
+print(f'Found {len(df)} total jobs')
+# Show summary of job states
+print(pd.crosstab(df.JobName, df.State).replace(0, '-'))
+
+stats = dict(
+    JobName=['count'],
+    Pending=['min', 'max'],
+    Timelimit=['unique'],
+    Elapsed=['median', 'min', 'max'],
+    ReqMem=['unique'],
+    MaxRSS=['median', 'min', 'max'],
+    )
+
+byname = df.groupby('JobName')
+print(byname.agg(stats).round(1))
+print('\n Disk usage')
+print(byname[['MaxDiskRead', 'MaxDiskWrite']].describe().round(1))
+
+if args.plot:
+    import matplotlib.pyplot as plt
+    for var in ['MaxRSS', 'MaxDiskRead', 'MaxDiskWrite', 'Pending', 'CPUTime']:
+        ax = df.boxplot(column=var, by='JobName')
+
+    plt.show()

@@ -1,0 +1,113 @@
+#!/usr/bin/env python
+"""
+Report current users and job counts for Slurm queues.
+"""
+import argparse
+import datetime
+import io
+import re
+import subprocess
+import pandas as pd
+
+# summary format string
+sfmt = '{name:17} {jobs:>6} {PD:>6} {R:>5} {CG:>5}  {cpu:4}  {wait:16} {priority}'
+
+# Array job IDs are the form: "jobid_[arrdef]" where arrdef is a comma separated
+# list of task numbers or ranges, followed by optional throttle definition (%n)
+rarrjob = re.compile(r'\d+_\[([\d,:-]+)(%\d+)?\]$')
+rarrdef = re.compile(r'(\d+)-(\d+)(?::(\d+))?')
+
+
+squeue_fmt = '%i|%P|%u|%t|%V|%S|%M|%C|%Q'
+squeue_nam = ['jobid', 'queue', 'user', 'state', 'submit', 'start', 'elapsed', 'cpu', 'priority']
+
+
+def arrsize(text):
+    """Calculate the number of elements in an array job specification"""
+    def toksize(tok):
+        m = rarrdef.match(tok)
+        if m:
+            return len(range(int(m[1]), 1+int(m[2]), int(m[3] or 1)))
+        else:
+            return 1
+    m = rarrjob.match(text)
+    if m:
+        return sum(toksize(tok) for tok in m.group(1).split(','))
+    else:
+        return 1
+
+
+def summarise(name, jobs):
+    info = {'name': name,
+            'jobs': jobs.ntask.sum(),
+            'PD': '',
+            'R': '',
+            'CG': '',
+            'cpu': jobs[jobs.state != 'PD'].cpu.sum(),
+            'wait': '',
+            'priority': f'{jobs.priority.min()}-{jobs.priority.max()}'}
+    info.update(jobs.groupby('state').ntask.sum())
+    m1 = jobs.start.notna() & (jobs.state != 'PD')
+    m2 = jobs.state == 'PD'
+    if m1.any():
+        # If any jobs are running we report the median wait time
+        info['wait'] = str((jobs.start - jobs.submit)[m1].median())[:12]
+    elif m2.any():
+        # Otherwise the maximum time a job has been pending
+        info['wait'] = str(jobs.wait.max())[:12]
+    return sfmt.format_map(info)
+
+
+def padelapsed(s):
+    """Need to ensure that elapsed time includes h:mm:ss at minimum"""
+    if len(s) == 4:
+        return '0:0'+s
+    elif len(s) == 5:
+        return '0:'+s
+    else:
+        return s
+
+
+def read_squeue_output(filepath, sort='priority'):
+    """Read the squeue output and display a summary"""
+
+    dat = pd.read_csv(filepath, sep='|', names=squeue_nam, header=None, parse_dates=[4, 5])
+
+    dat['elapsed'] = [padelapsed(s) for s in dat.elapsed]
+    dat['elapsed'] = pd.to_timedelta(dat.elapsed, errors='coerce')
+    dat['wait'] = datetime.datetime.now().replace(microsecond=0) - dat.submit
+    dat['ntask'] = [arrsize(j) for j in dat.jobid]  # Number of tasks for pending array jobs
+
+    counts = dat.groupby(['queue', 'user']).ntask.sum()
+    priority = dat.groupby(['queue', 'user']).priority.max()
+
+    print(sfmt.format(name='QUEUE_NAME', jobs='NJOBS', PD='PEND', R='RUN', CG='COMP',
+                      cpu='CPU', wait='Time Pending', priority='Priority'))
+    print(summarise('TOTAL', dat))
+    for part in counts.index.levels[0]:
+        queue = dat[dat.queue == part]
+        if sort == 'priority':
+            users = priority[part].sort_values(ascending=False)
+        else:
+            users = counts[part].sort_values(ascending=False)
+        print(summarise(part, queue))
+        for user in users.index:
+            ujobs = queue[queue.user == user]
+            print(summarise('  '+user, ujobs))
+        print('')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--partition', help='Partitions to view')
+    parser.add_argument('-s', dest='sort', action='store_const', const='jobs',
+                        help='Sort users by number of jobs (default = priority)')
+    parser.set_defaults(sort='priority')
+    args = parser.parse_args()
+
+    job = ['squeue', '-h', f'--format={squeue_fmt}']
+    if args.partition:
+        job.extend(['-p', args.partition])
+
+    subp = subprocess.run(job, capture_output=True, text=True)
+    read_squeue_output(io.StringIO(subp.stdout), args.sort)
